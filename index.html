@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Gravity Simulation</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { margin: 0; overflow: hidden; background: black; font-family: system-ui, sans-serif; }
+    canvas { display: block; }
+    #simSelector {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1000;
+      padding: 8px 12px;
+      background: rgba(30,30,30,0.6);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      font-size: 14px;
+      backdrop-filter: blur(4px);
+    }
+  </style>
+
+  <!-- import map: map "three" to actual module URL so example modules can import "three" -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.179.0/build/three.module.js",
+      "three/": "https://unpkg.com/three@0.179.0/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <select id="simSelector">
+    <option value="binary">Binary Stars</option>
+    <option value="planet">Sun + Planet Orbit</option>
+    <option value="grid">Gravity Grid Only</option>
+    <option value="blackhole">Black Hole + Lensing</option>
+  </select>
+
+  <script type="module">
+    // Import three & examples from unpkg; import map above resolves bare "three" inside these modules
+    import * as THREE from 'three';
+    import { OrbitControls } from 'https://unpkg.com/three@0.179.0/examples/jsm/controls/OrbitControls.js';
+    import { EffectComposer } from 'https://unpkg.com/three@0.179.0/examples/jsm/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'https://unpkg.com/three@0.179.0/examples/jsm/postprocessing/RenderPass.js';
+    import { ShaderPass } from 'https://unpkg.com/three@0.179.0/examples/jsm/postprocessing/ShaderPass.js';
+
+    // ---------- renderer / scene / camera ----------
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 5000);
+    camera.position.set(0, 40, 120);
+    camera.lookAt(0,0,0);
+
+    // ---------- controls ----------
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    controls.minDistance = 5;
+    controls.maxDistance = 2000;
+
+    // ---------- physics basics ----------
+    const G = 1;
+    const DT = 0.002;
+    let bodies = []; // dynamic bodies with physics
+    let sceneExtras = []; // non-physics visual meshes (e.g., black hole mesh, disk) to remove on reset
+    let currentBlackHole = null; // mesh reference for lens center
+
+    class Body {
+      constructor({ mass=1, position=new THREE.Vector3(), velocity=new THREE.Vector3(), color=0xffffff, radiusScale=0.25, emissive=true } = {}) {
+        this.mass = mass;
+        this.position = position.clone();
+        this.velocity = velocity.clone();
+        this.radiusScale = radiusScale;
+        this.color = color;
+        this.emissive = emissive;
+
+        const geom = new THREE.SphereGeometry(Math.cbrt(mass) * radiusScale, 32, 32);
+        const mat = emissive ? new THREE.MeshBasicMaterial({ color }) : new THREE.MeshPhongMaterial({ color, emissive: color, emissiveIntensity: 2 });
+        this.mesh = new THREE.Mesh(geom, mat);
+        this.mesh.position.copy(this.position);
+        scene.add(this.mesh);
+      }
+
+      updatePosition(dt) {
+        this.position.addScaledVector(this.velocity, dt);
+        this.mesh.position.copy(this.position);
+      }
+
+      dispose() {
+        scene.remove(this.mesh);
+        if (this.mesh.geometry) this.mesh.geometry.dispose();
+        if (this.mesh.material) this.mesh.material.dispose();
+      }
+    }
+
+    // ---------- gravity grid (visual fabric) ----------
+    const gridSize = 60;
+    const spacing = 1.0;
+    const positions = [];
+    const basePositions = [];
+    const colors = [];
+    for (let x = -gridSize; x <= gridSize; x++) {
+      for (let y = -gridSize; y <= gridSize; y++) {
+        positions.push(x * spacing, y * spacing, 0);
+        basePositions.push(x * spacing, y * spacing, 0);
+        colors.push(0,0,1);
+      }
+    }
+    const gridGeometry = new THREE.BufferGeometry();
+    gridGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    gridGeometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    const gridMaterial = new THREE.PointsMaterial({ size: 0.05, vertexColors: true });
+    const grid = new THREE.Points(gridGeometry, gridMaterial);
+    scene.add(grid);
+
+    function updateGrid() {
+      const posAttr = gridGeometry.attributes.position;
+      const colAttr = gridGeometry.attributes.color;
+      for (let i = 0; i < posAttr.count; i++) {
+        const x = basePositions[i*3];
+        const y = basePositions[i*3 + 1];
+        let zOffset = 0;
+        let fieldStrength = 0;
+        for (const b of bodies) {
+          const dx = x - b.position.x;
+          const dy = y - b.position.y;
+          const distSq = dx*dx + dy*dy + 1.0;
+          const dist = Math.sqrt(distSq);
+          // both sun/planets distort
+          zOffset -= b.mass / (dist + 1);
+          fieldStrength += b.mass / distSq;
+        }
+        posAttr.setXYZ(i, x, y, zOffset * 0.05);
+        const strength = Math.min(fieldStrength * 0.02, 1.0);
+        colAttr.setXYZ(i, strength, 0, 1 - strength);
+      }
+      gridGeometry.attributes.position.needsUpdate = true;
+      gridGeometry.attributes.color.needsUpdate = true;
+    }
+
+    // ---------- basic lighting for non-emissive bodies ----------
+    scene.add(new THREE.AmbientLight(0x404040, 1.5));
+    const mainLight = new THREE.PointLight(0xffffff, 1.0, 0);
+    mainLight.position.set(50,50,50);
+    scene.add(mainLight);
+
+    // ---------- starfield ----------
+    let starfield = null;
+    function addStarfield() {
+      if (starfield) { scene.remove(starfield); starfield.geometry.dispose(); starfield.material.dispose(); starfield = null; }
+      const starGeo = new THREE.BufferGeometry();
+      const N = 2000;
+      const arr = new Float32Array(N * 3);
+      for (let i=0;i<N;i++){
+        const a = Math.random() * Math.PI * 2;
+        const r = 200 + Math.random()*400;
+        const z = (Math.random()-0.5)*50;
+        arr[i*3+0] = Math.cos(a)*r;
+        arr[i*3+1] = Math.sin(a)*r;
+        arr[i*3+2] = z;
+      }
+      starGeo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+      const starMat = new THREE.PointsMaterial({ size: 0.8, color: 0xffffff });
+      starfield = new THREE.Points(starGeo, starMat);
+      scene.add(starfield);
+    }
+    addStarfield();
+
+    // ---------- postprocessing (lensing) ----------
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+
+    // simple lensing shader (screen-space radial displacement)
+    const LensingShader = {
+      uniforms: {
+        "tDiffuse": { value: null },
+        "center":   { value: new THREE.Vector2(0.5,0.5) },
+        "strength": { value: 0.3 }, // adjust for effect
+        "aspect":   { value: window.innerWidth / window.innerHeight }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+      `,
+      fragmentShader: `
+        precision highp float;
+        varying vec2 vUv;
+        uniform sampler2D tDiffuse;
+        uniform vec2 center;
+        uniform float strength;
+        uniform float aspect;
+
+        void main(){
+          vec2 uv = vUv;
+          vec2 delta = uv - center;
+          delta.x *= aspect;
+          float r = length(delta);
+          float inv = strength / (r*r + 0.0005);
+          vec2 dir = (r > 0.0) ? (delta / r) : vec2(0.0);
+          vec2 offset = dir * inv;
+          offset.x /= aspect;
+          vec2 warped = clamp(uv + offset, vec2(0.001), vec2(0.999));
+          gl_FragColor = texture2D(tDiffuse, warped);
+        }
+      `
+    };
+
+    const lensPass = new ShaderPass(LensingShader);
+    lensPass.enabled = false;
+    composer.addPass(lensPass);
+    composer.setSize(window.innerWidth, window.innerHeight);
+
+    // ---------- helpers to clear scene ----------
+    function clearBodiesAndExtras() {
+      // remove bodies
+      for (const b of bodies) b.dispose();
+      bodies = [];
+      // remove extras
+      for (const m of sceneExtras) {
+        scene.remove(m);
+        if (m.geometry) m.geometry.dispose();
+        if (m.material) m.material.dispose();
+      }
+      sceneExtras = [];
+      currentBlackHole = null;
+      // reset lensing
+      lensPass.enabled = false;
+    }
+
+    // ---------- simulation setups ----------
+    function setupSingleSun() {
+      clearBodiesAndExtras();
+      const sun = new Body({ mass: 4000, position: new THREE.Vector3(0,0,0), velocity: new THREE.Vector3(0,0,0), color:0xffffff, radiusScale:0.5, emissive:true });
+      bodies.push(sun);
+      const r = 20;
+      const v = Math.sqrt(G * sun.mass / r);
+      const planet = new Body({ mass: 10, position: new THREE.Vector3(r,0,0), velocity: new THREE.Vector3(0,v,0), color:0x00ff00, radiusScale:0.2, emissive:false });
+      bodies.push(planet);
+    }
+
+    function setupBinaryEqual() {
+      clearBodiesAndExtras();
+      const m = 3000, d = 20;
+      const r = d/2;
+      const v = Math.sqrt((G * m) / (2 * r));
+      bodies.push(new Body({ mass: m, position: new THREE.Vector3(-r,0,0), velocity: new THREE.Vector3(0,v,0), color:0xffffff, radiusScale:0.4, emissive:true }));
+      bodies.push(new Body({ mass: m, position: new THREE.Vector3( r,0,0), velocity: new THREE.Vector3(0,-v,0), color:0xffffff, radiusScale:0.4, emissive:true }));
+    }
+
+    function setupBinaryUnequal() {
+      clearBodiesAndExtras();
+      const m1 = 4000, m2 = 2000, d=24;
+      const r1 = (m2/(m1+m2))*d, r2 = (m1/(m1+m2))*d;
+      const omega = Math.sqrt(G*(m1+m2)/(d*d*d));
+      const v1 = omega*r1, v2 = omega*r2;
+      bodies.push(new Body({ mass: m1, position: new THREE.Vector3(-r1,0,0), velocity: new THREE.Vector3(0,v1,0), color:0xffffff, radiusScale:0.5, emissive:true }));
+      bodies.push(new Body({ mass: m2, position: new THREE.Vector3( r2,0,0), velocity: new THREE.Vector3(0,-v2,0), color:0xffffff, radiusScale:0.4, emissive:true }));
+    }
+
+    function setupCircumbinary() {
+      clearBodiesAndExtras();
+      const m1=4000, m2=3000, d=20;
+      const r1 = (m2/(m1+m2))*d, r2 = (m1/(m1+m2))*d;
+      const omega = Math.sqrt(G*(m1+m2)/(d*d*d));
+      const v1 = omega*r1, v2 = omega*r2;
+      bodies.push(new Body({ mass:m1, position:new THREE.Vector3(-r1,0,0), velocity:new THREE.Vector3(0,v1,0), color:0xffffff, radiusScale:0.5, emissive:true }));
+      bodies.push(new Body({ mass:m2, position:new THREE.Vector3( r2,0,0), velocity:new THREE.Vector3(0,-v2,0), color:0xffffff, radiusScale:0.45, emissive:true }));
+      const r = 50;
+      const v = Math.sqrt(G*(m1+m2)/r);
+      bodies.push(new Body({ mass:10, position:new THREE.Vector3(r,0,0), velocity:new THREE.Vector3(0,v,0), color:0x00ff00, radiusScale:0.2, emissive:false }));
+    }
+
+    function setupBlackHoleLensing() {
+      clearBodiesAndExtras();
+      // add central BH (big mass, non-emissive)
+      const bhMass = 20000;
+      const bhRadius = 8;
+      const bhGeom = new THREE.SphereGeometry(bhRadius, 64, 64);
+      const bhMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+      const blackHoleMesh = new THREE.Mesh(bhGeom, bhMat);
+      blackHoleMesh.position.set(0,0,0);
+      scene.add(blackHoleMesh);
+      sceneExtras.push(blackHoleMesh);
+      currentBlackHole = blackHoleMesh;
+
+      // accretion disk (ring)
+      const diskInner = bhRadius * 1.4;
+      const diskOuter = bhRadius * 3.5;
+      const diskGeom = new THREE.RingGeometry(diskInner, diskOuter, 128);
+      const diskMat = new THREE.MeshBasicMaterial({ color: 0xffaa33, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
+      const disk = new THREE.Mesh(diskGeom, diskMat);
+      disk.rotation.x = Math.PI / 2;
+      scene.add(disk);
+      sceneExtras.push(disk);
+
+      // Add a test bright star orbiting the BH so you can see lensing
+      const r = 35;
+      const v = Math.sqrt(G * bhMass / r);
+      const star = new Body({ mass: 20, position: new THREE.Vector3(r,0,0), velocity: new THREE.Vector3(0,v,0), color:0xffffff, radiusScale:0.25, emissive:true });
+      bodies.push(star);
+
+      // enable lens pass
+      lensPass.enabled = true;
+      // stronger effect for BH mode
+      lensPass.uniforms.strength.value = 0.025;
+    }
+
+    // ---------- core physics ----------
+    function computeForces() {
+      for (let i=0;i<bodies.length;i++){
+        const b1 = bodies[i];
+        const accel = new THREE.Vector3();
+        for (let j=0;j<bodies.length;j++){
+          if (i===j) continue;
+          const b2 = bodies[j];
+          const dir = b2.position.clone().sub(b1.position);
+          const dist = dir.length();
+          dir.normalize();
+          const fOverM = (G * b2.mass) / (dist*dist + 1.0); // softened acceleration
+          accel.add(dir.multiplyScalar(fOverM));
+        }
+        b1.velocity.add(accel.multiplyScalar(DT));
+      }
+    }
+
+    // ---------- UI selector ----------
+    const selector = document.getElementById('simSelector');
+    selector.addEventListener('change', (e) => {
+      switch (e.target.value) {
+        case 'binary': setupBinaryUnequal(); break;
+        case 'planet': setupSingleSun(); break;
+        case 'grid':   clearBodiesAndExtras(); break;
+        case 'blackhole': setupBlackHoleLensing(); break;
+      }
+    });
+
+    // default start
+    setupBinaryUnequal();
+
+    // ---------- animation ----------
+    const ndc = new THREE.Vector3();
+    function updateLensCenterToBH() {
+      if (!currentBlackHole) return;
+      ndc.copy(currentBlackHole.position).project(camera);
+      const uvx = (ndc.x * 0.5) + 0.5;
+      const uvy = (ndc.y * 0.5) + 0.5;
+      lensPass.uniforms.center.value.set(uvx, uvy);
+      lensPass.uniforms.aspect.value = renderer.getSize(new THREE.Vector2()).x / renderer.getSize(new THREE.Vector2()).y;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      computeForces();
+      bodies.forEach(b => b.updatePosition(DT));
+      updateGrid();
+      controls.update();
+
+      // if lensing enabled, update center and use composer
+      if (lensPass.enabled) {
+        updateLensCenterToBH();
+        composer.render();
+      } else {
+        renderer.render(scene, camera);
+      }
+    }
+    animate();
+
+    // ---------- resize ----------
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth, h = window.innerHeight;
+      renderer.setSize(w,h);
+      camera.aspect = w/h;
+      camera.updateProjectionMatrix();
+      composer.setSize(w,h);
+      lensPass.uniforms.aspect.value = w/h;
+    });
+
+  </script>
+</body>
+</html>
+  
